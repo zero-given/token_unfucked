@@ -1,4 +1,4 @@
-import { Component, createMemo, onMount, onCleanup, createSignal } from 'solid-js';
+import { Component, createMemo, onMount, onCleanup, createSignal, createEffect } from 'solid-js';
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -38,6 +38,7 @@ interface ChartProps {
   token: Token;
   history: TokenHistory[];
   type: 'liquidity' | 'holders';
+  onTrendUpdate?: (direction: 'up' | 'down' | 'stagnant') => void;
 }
 
 export const TokenChart: Component<ChartProps> = (props) => {
@@ -45,6 +46,7 @@ export const TokenChart: Component<ChartProps> = (props) => {
   let chart: ChartJS | undefined;
   const [isLoading, setIsLoading] = createSignal(true);
   const [error, setError] = createSignal<string | null>(null);
+  const [isChartActive, setIsChartActive] = createSignal(false);
 
   // Memoize data processing
   const processedData = createMemo(() => {
@@ -94,6 +96,41 @@ export const TokenChart: Component<ChartProps> = (props) => {
     }
   });
 
+  // Calculate trend data
+  const trendInfo = createMemo(() => {
+    const data = processedData();
+    if (data.length < 2) return { trendDirection: 'stagnant' as const, trendData: [] };
+
+    // Linear regression calculation
+    const xValues = data.map((_, i) => i);
+    const yValues = data.map(d => d.y);
+    const xMean = xValues.reduce((a, b) => a + b, 0) / xValues.length;
+    const yMean = yValues.reduce((a, b) => a + b, 0) / yValues.length;
+    
+    const numerator = xValues.reduce((acc, x, i) => acc + (x - xMean) * (yValues[i] - yMean), 0);
+    const denominator = xValues.reduce((acc, x) => acc + Math.pow(x - xMean, 2), 0);
+    const slope = numerator / denominator;
+    const intercept = yMean - slope * xMean;
+
+    // Determine trend direction
+    let trendDirection: 'up' | 'down' | 'stagnant' = 'stagnant';
+    if (slope > 0.05) trendDirection = 'up';
+    else if (slope < -0.05) trendDirection = 'down';
+
+    // Generate trend line data
+    const trendData = data.map((d, i) => ({
+      x: d.x,
+      y: slope * i + intercept
+    }));
+
+    return { trendDirection, trendData };
+  });
+
+  // Notify parent of trend updates
+  createEffect(() => {
+    props.onTrendUpdate?.(trendInfo().trendDirection);
+  });
+
   const createOrUpdateChart = () => {
     try {
       if (!chartContainer) return;
@@ -114,24 +151,38 @@ export const TokenChart: Component<ChartProps> = (props) => {
       // Destroy existing chart
       if (chart) {
         chart.destroy();
+        setIsChartActive(false);
       }
 
       // Create new chart with optimized options
       chart = new ChartJS(ctx, {
         type: 'line',
         data: {
-          datasets: [{
-            label: props.type === 'liquidity' ? 'Liquidity ($)' : 'Holders',
-            data: data,
-            borderColor: props.type === 'liquidity' ? '#3182CE' : '#805AD5',
-            backgroundColor: props.type === 'liquidity' ? '#3182CE33' : '#805AD533',
-            fill: true,
-            tension: 0.1,
-            pointRadius: 0, // Hide points for better performance
-            pointHoverRadius: 4,
-            borderWidth: 2,
-            spanGaps: true, // Connect points across gaps
-          }]
+          datasets: [
+            {
+              label: props.type === 'liquidity' ? 'Liquidity ($)' : 'Holders',
+              data: data,
+              borderColor: props.type === 'liquidity' ? '#3182CE' : '#805AD5',
+              backgroundColor: props.type === 'liquidity' ? '#3182CE33' : '#805AD533',
+              fill: true,
+              tension: 0.1,
+              pointRadius: 0, // Hide points for better performance
+              pointHoverRadius: 4,
+              borderWidth: 2,
+              spanGaps: true, // Connect points across gaps
+            },
+            {
+              label: 'Trend Line',
+              data: trendInfo().trendData,
+              borderColor: trendInfo().trendDirection === 'up' ? '#22c55e' : 
+                        trendInfo().trendDirection === 'down' ? '#ef4444' : '#64748b',
+              borderWidth: 2,
+              borderDash: [5, 5],
+              pointRadius: 0,
+              tension: 0,
+              fill: false
+            }
+          ]
         },
         options: {
           responsive: true,
@@ -211,6 +262,7 @@ export const TokenChart: Component<ChartProps> = (props) => {
         }
       });
 
+      setIsChartActive(true);
       setError(null);
       setIsLoading(false);
     } catch (err) {
@@ -225,21 +277,30 @@ export const TokenChart: Component<ChartProps> = (props) => {
 
   // Handle resize
   const handleResize = debounce(() => {
-    if (!chartContainer || !chart) return;
+    if (!chartContainer || !chart || !isChartActive()) return;
     
-    const canvas = chartContainer.querySelector('canvas');
-    if (!canvas) return;
+    try {
+      const canvas = chartContainer.querySelector('canvas');
+      if (!canvas) return;
 
-    canvas.style.width = '100%';
-    canvas.style.height = '100%';
-    
-    chart.resize();
+      canvas.style.width = '100%';
+      canvas.style.height = '100%';
+      
+      chart.resize();
+    } catch (err) {
+      console.error('[Chart] Error resizing chart:', err);
+    }
   }, 250);
 
   onMount(() => {
     requestAnimationFrame(createOrUpdateChart);
 
-    const observer = new ResizeObserver(handleResize);
+    const observer = new ResizeObserver(() => {
+      if (isChartActive()) {
+        handleResize();
+      }
+    });
+
     if (chartContainer) {
       observer.observe(chartContainer);
     }
@@ -247,6 +308,7 @@ export const TokenChart: Component<ChartProps> = (props) => {
     onCleanup(() => {
       observer.disconnect();
       if (chart) {
+        setIsChartActive(false);
         chart.destroy();
       }
     });

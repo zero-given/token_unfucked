@@ -189,3 +189,12 @@ export interface SearchConfig {
     store?: string[];
   };
 }
+
+export type TrendDirection = 'up' | 'down' | 'stagnant';
+
+export interface ChartProps {
+  token: Token;
+  history: TokenHistory[];
+  type: 'liquidity' | 'holders';
+  onTrendUpdate?: (direction: TrendDirection) => void;
+}

@@ -1,5 +1,5 @@
-import { Component, createSignal, createMemo, onMount, createEffect } from 'solid-js';
-import { createVirtualizer } from '@tanstack/solid-virtual';
+import { Component, createSignal, createMemo, onMount, createEffect, onCleanup } from 'solid-js';
+import { createVirtualizer, type VirtualItem, type Virtualizer } from '@tanstack/solid-virtual';
 import { TokenEventCard } from './TokenEventCard';
 import { Layout, List } from 'lucide-solid';
 import { TrendBadge } from './TrendBadge';
@@ -13,6 +13,19 @@ interface TokenEventsListProps {
 type SortField = 'age' | 'holders' | 'liquidity' | 'safetyScore';
 
 const STORAGE_KEY = 'tokenListFilters';
+
+const getRiskScore = (token: Token): number => {
+  switch (token.riskLevel) {
+    case 'safe':
+      return 2;
+    case 'warning':
+      return 1;
+    case 'danger':
+      return 0;
+    default:
+      return 0;
+  }
+};
 
 export const TokenEventsList: Component<TokenEventsListProps> = (props) => {
   // Performance metrics
@@ -174,21 +187,33 @@ export const TokenEventsList: Component<TokenEventsListProps> = (props) => {
     return result.slice(0, currentFilters.maxRecords);
   });
 
-  // Create a signal to force virtualizer recreation
-  const [virtualizerKey, setVirtualizerKey] = createSignal(0);
+  // Remove virtualizerKey and forceUpdateKey signals
+  const [measuredHeights, setMeasuredHeights] = createSignal<Map<number, number>>(new Map());
 
-  // Add ref for scroll container
+  // Add ref for scroll container and item measurements
   let scrollContainerRef: HTMLDivElement | undefined;
+  const itemRefs = new Map<number, HTMLDivElement>();
+
+  // Constants for card heights
+  const COLLAPSED_HEIGHT = 42;
+  const EXPANDED_HEIGHT = 800;
 
   const estimateSize = (index: number) => {
     const token = filteredTokens()[index];
-    if (!token) return 84;
-    return expandedTokens().has(token.tokenAddress) ? 800 : 84;
+    if (!token) return COLLAPSED_HEIGHT;
+    
+    // Check if we have a measured height for this item
+    const measuredHeight = measuredHeights().get(index);
+    if (measuredHeight) {
+      return measuredHeight;
+    }
+    
+    // Fallback to estimated height
+    return expandedTokens().has(token.tokenAddress) ? EXPANDED_HEIGHT : COLLAPSED_HEIGHT;
   };
 
-  // Update virtualizer creation
+  // Update virtualizer creation to be more efficient
   const virtualizer = createMemo(() => {
-    const key = virtualizerKey();
     const tokens = filteredTokens();
     
     return createVirtualizer({
@@ -196,9 +221,98 @@ export const TokenEventsList: Component<TokenEventsListProps> = (props) => {
       getScrollElement: () => scrollContainerRef ?? null,
       estimateSize,
       overscan: 5,
-      scrollMargin: 200
+      scrollMargin: 200,
+      initialOffset: scrollContainerRef?.scrollTop || 0,
     });
   });
+
+  // Add effect to handle item measurements and resizing
+  createEffect(() => {
+    const resizeObserver = new ResizeObserver(entries => {
+      let needsRemeasure = false;
+      const newHeights = new Map(measuredHeights());
+
+      for (const entry of entries) {
+        const index = parseInt(entry.target.getAttribute('data-index') || '-1', 10);
+        if (index >= 0) {
+          const currentHeight = entry.target.getBoundingClientRect().height;
+          const prevHeight = newHeights.get(index);
+          
+          if (prevHeight !== currentHeight) {
+            newHeights.set(index, currentHeight);
+            itemRefs.set(index, entry.target as HTMLDivElement);
+            needsRemeasure = true;
+          }
+        }
+      }
+
+      if (needsRemeasure) {
+        // Store current scroll position
+        const currentScroll = scrollContainerRef?.scrollTop || 0;
+        
+        // Update measured heights and trigger remeasure
+        setMeasuredHeights(newHeights);
+        virtualizer().measure();
+        
+        // Restore scroll position after a short delay
+        requestAnimationFrame(() => {
+          if (scrollContainerRef) {
+            scrollContainerRef.scrollTop = currentScroll;
+          }
+        });
+      }
+    });
+
+    // Observe all virtual items
+    const items = virtualizer().getVirtualItems();
+    items.forEach(virtualItem => {
+      const element = document.querySelector(`[data-index="${virtualItem.index}"]`);
+      if (element) {
+        resizeObserver.observe(element);
+      }
+    });
+
+    onCleanup(() => resizeObserver.disconnect());
+  });
+
+  // Handle token click with logging
+  const handleTokenClick = (tokenAddress: string, e: MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    
+    const token = filteredTokens().find(t => t.tokenAddress === tokenAddress);
+    if (token) {
+      logDebug(`Token clicked: ${token.tokenSymbol} (${tokenAddress})`);
+    }
+    
+    // Store current scroll position
+    const currentScroll = scrollContainerRef?.scrollTop || 0;
+    
+    // Toggle expansion
+    toggleTokenExpansion(tokenAddress);
+    
+    // Find the index before measuring
+    const index = filteredTokens().findIndex(t => t.tokenAddress === tokenAddress);
+    
+    // Clear measured height for this item to force recalculation
+    const newHeights = new Map(measuredHeights());
+    newHeights.delete(index);
+    setMeasuredHeights(newHeights);
+    
+    // Measure without recreating the virtualizer
+    virtualizer().measure();
+    
+    // Scroll to the clicked token after a short delay
+    if (index >= 0) {
+      requestAnimationFrame(() => {
+        virtualizer().scrollToIndex(index, {
+          align: 'start',
+          behavior: 'smooth'
+        });
+        logDebug(`Scrolled to token: ${tokenAddress} at index ${index}`);
+      });
+    }
+  };
 
   // Save filters whenever they change
   const updateFilters = (newFilters: FilterState | ((prev: FilterState) => FilterState)) => {
@@ -206,11 +320,13 @@ export const TokenEventsList: Component<TokenEventsListProps> = (props) => {
       const updated = typeof newFilters === 'function' ? newFilters(prev) : newFilters;
       localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
       
-      // Force virtualizer recreation
-      setVirtualizerKey(k => k + 1);
+      // Force scroll to top for filter changes
+      if (scrollContainerRef) {
+        scrollContainerRef.scrollTop = 0;
+      }
       
-      // Force scroll to top
-      window.scrollTo(0, 0);
+      // Clear all measured heights when filters change
+      setMeasuredHeights(new Map());
       
       return updated;
     });
@@ -219,7 +335,21 @@ export const TokenEventsList: Component<TokenEventsListProps> = (props) => {
   // Add effect to handle window resize
   createEffect(() => {
     const handleResize = () => {
-      setVirtualizerKey(k => k + 1);
+      // Store current scroll position
+      const currentScroll = scrollContainerRef?.scrollTop || 0;
+      
+      // Clear all measured heights on resize
+      setMeasuredHeights(new Map());
+      
+      // Measure without recreating the virtualizer
+      virtualizer().measure();
+      
+      // Restore scroll position after resize
+      requestAnimationFrame(() => {
+        if (scrollContainerRef) {
+          scrollContainerRef.scrollTop = currentScroll;
+        }
+      });
     };
 
     window.addEventListener('resize', handleResize);
@@ -228,20 +358,6 @@ export const TokenEventsList: Component<TokenEventsListProps> = (props) => {
       window.removeEventListener('resize', handleResize);
     };
   });
-
-  // Calculate numeric risk score
-  const getRiskScore = (token: Token): number => {
-    switch (token.riskLevel) {
-      case 'safe':
-        return 2;
-      case 'warning':
-        return 1;
-      case 'danger':
-        return 0;
-      default:
-        return 0;
-    }
-  };
 
   // Add history storage with localStorage caching
   const HISTORY_CACHE_KEY = 'tokenHistoryCache';
@@ -428,40 +544,6 @@ export const TokenEventsList: Component<TokenEventsListProps> = (props) => {
     return result;
   };
 
-  // Add a signal to track which tokens have been rendered
-  const [renderedTokens, setRenderedTokens] = createSignal<Set<string>>(new Set());
-
-  // Add an intersection observer to track visible tokens
-  createEffect(() => {
-    const observer = new IntersectionObserver(
-      (entries) => {
-        entries.forEach(entry => {
-          const tokenAddress = entry.target.getAttribute('data-token');
-          if (tokenAddress) {
-            if (entry.isIntersecting) {
-              setRenderedTokens(prev => {
-                const next = new Set(prev);
-                next.add(tokenAddress);
-                return next;
-              });
-            }
-          }
-        });
-      },
-      {
-        rootMargin: '100px',
-        threshold: 0
-      }
-    );
-
-    // Clean up previous observations
-    return () => observer.disconnect();
-  });
-
-  // Constants for card heights
-  const COLLAPSED_HEIGHT = 84;
-  const EXPANDED_HEIGHT = 800;
-
   // Calculate positions for all tokens
   const calculatePositions = () => {
     const positions = new Map<string, number>();
@@ -486,29 +568,6 @@ export const TokenEventsList: Component<TokenEventsListProps> = (props) => {
     });
     return height;
   });
-
-  // Handle token click with logging
-  const handleTokenClick = (tokenAddress: string, e: MouseEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    
-    const token = filteredTokens().find(t => t.tokenAddress === tokenAddress);
-    if (token) {
-      logDebug(`Token clicked: ${token.tokenSymbol} (${tokenAddress})`);
-    }
-    
-    // Toggle expansion
-    toggleTokenExpansion(tokenAddress);
-
-    // Scroll handling
-    setTimeout(() => {
-      const element = document.querySelector(`[data-token="${tokenAddress}"]`);
-      if (element && expandedTokens().has(tokenAddress)) {
-        element.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        logDebug(`Scrolled to token: ${tokenAddress}`);
-      }
-    }, 50);
-  };
 
   // Add download logs button
   const downloadLogs = () => {
